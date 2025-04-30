@@ -1,5 +1,5 @@
 
-;; title: data_storage
+;; title: user_identity
 ;; version:
 ;; summary:
 ;; description:
@@ -28,109 +28,227 @@
 ;; private functions
 ;;
 
-;; Health Data Storage and Access Control Contract
+;; User Authentication and Identity Management Contract
 
 ;; Constants
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
 (define-constant err-unauthorized (err u101))
-(define-constant err-already-exists (err u102))
+(define-constant err-already-registered (err u102))
 (define-constant err-not-found (err u103))
+(define-constant err-invalid-role (err u104))
 
-;; Data Variables
-(define-map health-records
+;; Define roles as uint values
+(define-constant ROLE-PATIENT u1)
+(define-constant ROLE-DOCTOR u2)
+(define-constant ROLE-RESEARCHER u3)
+(define-constant ROLE-ADMIN u4)
+
+;; Data structures
+(define-map user-identities
     principal
     {
-        data-hash: (string-utf8 64),        ;; IPFS hash or encrypted data reference
-        is-active: bool,
-        last-updated: uint
+        did: (string-utf8 64),              ;; Decentralized Identity
+        role: uint,                         ;; User role
+        verification-status: bool,          ;; Whether the identity is verified
+        metadata: (string-utf8 256),        ;; Additional identity metadata
+        registration-time: uint,            ;; When the identity was registered
+        last-updated: uint                  ;; Last update timestamp
     }
 )
 
-(define-map access-permissions
-    {owner: principal, accessor: principal}
+(define-map role-permissions
+    uint
     {
-        can-read: bool,
-        can-write: bool,
-        expiration: uint
+        can-verify-others: bool,
+        can-update-permissions: bool,
+        can-access-anonymized-data: bool
     }
 )
 
-;; Private Functions
-(define-private (is-authorized (owner principal) (accessor principal))
-    (let ((permissions (unwrap! (map-get? access-permissions {owner: owner, accessor: accessor})
-                               false)))
-        (and (get can-read permissions)
-             (> (get expiration permissions) block-height))
+(define-map verification-requests
+    principal
+    {
+        proof-document: (string-utf8 64),
+        requested-role: uint,
+        status: (string-utf8 20),
+        verifier: (optional principal)
+    }
+)
+
+;; Initialize role permissions
+(map-set role-permissions ROLE-PATIENT
+    {
+        can-access-anonymized-data: false,
+        can-verify-others: false,
+        can-update-permissions: false
+    }
+)
+
+(map-set role-permissions ROLE-DOCTOR
+    {
+        can-access-anonymized-data: true,
+        can-verify-others: false,
+        can-update-permissions: false
+    }
+)
+
+(map-set role-permissions ROLE-RESEARCHER
+    {
+        can-access-anonymized-data: true,
+        can-verify-others: false,
+        can-update-permissions: false
+    }
+)
+
+(map-set role-permissions ROLE-ADMIN
+    {
+        can-access-anonymized-data: true,
+        can-verify-others: true,
+        can-update-permissions: true
+    }
+)
+
+;; Private functions
+(define-private (is-admin (user principal))
+    (let ((identity (unwrap! (map-get? user-identities user) false)))
+        (and
+            (is-eq (get role identity) ROLE-ADMIN)
+            (get verification-status identity)
+        )
     )
 )
 
-;; Public Functions
+(define-private (can-verify (user principal))
+    (let ((identity (unwrap! (map-get? user-identities user) false)))
+        (let ((permissions (unwrap! (map-get? role-permissions (get role identity)) false)))
+            (and
+                (get verification-status identity)
+                (get can-verify-others permissions)
+            )
+        )
+    )
+)
 
-;; Store or update health data
-(define-public (store-health-data (data-hash (string-utf8 64)))
-    (let ((existing-record (map-get? health-records tx-sender)))
-        (ok (map-set health-records
+;; Public functions
+
+;; Register new identity
+(define-public (register-identity (did (string-utf8 64)) (role uint) (metadata (string-utf8 256)))
+    (let ((existing-identity (map-get? user-identities tx-sender)))
+        (asserts! (is-none existing-identity) (err err-already-registered))
+        (asserts! (or (is-eq role ROLE-PATIENT)
+                     (is-eq role ROLE-DOCTOR)
+                     (is-eq role ROLE-RESEARCHER))
+                 (err err-invalid-role))
+        
+        (ok (map-set user-identities
             tx-sender
             {
-                data-hash: data-hash,
-                is-active: true,
+                did: did,
+                role: role,
+                verification-status: (is-eq role ROLE-PATIENT),  ;; Auto-verify patients
+                metadata: metadata,
+                registration-time: block-height,
                 last-updated: block-height
             }
         ))
     )
 )
 
-;; Grant access to another principal
-(define-public (grant-access (accessor principal) (can-read bool) (can-write bool) (duration uint))
-    (ok (map-set access-permissions
-        {owner: tx-sender, accessor: accessor}
-        {
-            can-read: can-read,
-            can-write: can-write,
-            expiration: (+ block-height duration)
-        }
-    ))
+;; Submit verification request
+(define-public (submit-verification-request (proof-document (string-utf8 64)))
+    (let ((identity (unwrap! (map-get? user-identities tx-sender)
+                            (err err-not-found))))
+        (ok (map-set verification-requests
+            tx-sender
+            {
+                proof-document: proof-document,
+                requested-role: (get role identity),
+                status: u"pending",
+                verifier: none  ;; Simply use none for optional values
+            }
+        ))
+    )
 )
 
-;; Revoke access from a principal
-(define-public (revoke-access (accessor principal))
-    (ok (map-delete access-permissions
-        {owner: tx-sender, accessor: accessor}
-    ))
-)
-
-;; Read health data (only if authorized)
-(define-public (read-health-data (owner principal))
-    (let ((record (unwrap! (map-get? health-records owner)
-                          (err err-not-found))))
-        (if (or (is-eq tx-sender owner)
-                (is-authorized owner tx-sender))
-            (ok record)
-            (err err-unauthorized)
+;; Verify identity (admin only)
+(define-public (verify-identity (user principal))
+    (let ((request (unwrap! (map-get? verification-requests user)
+                           (err err-not-found))))
+        (asserts! (can-verify tx-sender) (err err-unauthorized))
+        
+        (map-set verification-requests user
+            (merge request {
+                status: u"approved",  ;; Changed to string-utf8
+                verifier: (some tx-sender)
+            })
+        )
+        
+        (let ((identity (unwrap! (map-get? user-identities user)
+                                (err err-not-found))))
+            (ok (map-set user-identities user
+                (merge identity {
+                    verification-status: true,
+                    last-updated: block-height
+                })
+            ))
         )
     )
 )
 
-;; Delete health data
-(define-public (delete-health-data)
-    (ok (map-delete health-records tx-sender))
+;; Update identity metadata
+(define-public (update-metadata (new-metadata (string-utf8 256)))
+    (let ((identity (unwrap! (map-get? user-identities tx-sender)
+                            (err err-not-found))))
+        (ok (map-set user-identities
+            tx-sender
+            (merge identity {
+                metadata: new-metadata,
+                last-updated: block-height
+            })
+        ))
+    )
 )
 
-;; Check if has access
-(define-read-only (check-access (owner principal) (accessor principal))
-    (let ((permissions (map-get? access-permissions {owner: owner, accessor: accessor})))
-        (if (is-none permissions)
-            false
-            (let ((unwrapped-permissions (unwrap-panic permissions)))
-                (and (get can-read unwrapped-permissions)
-                     (> (get expiration unwrapped-permissions) block-height))
+;; Check if user has specific permission
+(define-read-only (has-permission (user principal) (permission-key (string-utf8 64)))
+    (let ((identity (unwrap! (map-get? user-identities user) false)))
+        (let ((permissions (unwrap! (map-get? role-permissions (get role identity)) false)))
+            (and
+                (get verification-status identity)
+                (if (is-eq permission-key u"can-verify-others")
+                    (get can-verify-others permissions)
+                    (if (is-eq permission-key u"can-update-permissions")
+                        (get can-update-permissions permissions)
+                        (if (is-eq permission-key u"can-access-anonymized-data")
+                            (get can-access-anonymized-data permissions)
+                            false  ;; default case for unknown permissions
+                        )
+                    )
+                )
             )
         )
     )
 )
 
-;; Get access details
-(define-read-only (get-access-details (owner principal) (accessor principal))
-    (map-get? access-permissions {owner: owner, accessor: accessor})
+;; Get identity details
+(define-read-only (get-identity (user principal))
+    (map-get? user-identities user)
+)
+
+;; Get verification request status
+(define-read-only (get-verification-request (user principal))
+    (map-get? verification-requests user)
+)
+
+;; Check if user is verified
+(define-read-only (is-verified (user principal))
+    (let ((identity (unwrap! (map-get? user-identities user) false)))
+        (get verification-status identity)
+    )
+)
+
+;; Get role permissions
+(define-read-only (get-role-permissions (role uint))
+    (map-get? role-permissions role)
 )
