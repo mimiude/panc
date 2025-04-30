@@ -196,6 +196,8 @@
     )
 )
 
+
+
 ;; Update identity metadata
 (define-public (update-metadata (new-metadata (string-utf8 256)))
     (let ((identity (unwrap! (map-get? user-identities tx-sender)
@@ -209,6 +211,8 @@
         ))
     )
 )
+
+
 
 ;; Check if user has specific permission
 (define-read-only (has-permission (user principal) (permission-key (string-utf8 64)))
@@ -231,6 +235,8 @@
     )
 )
 
+
+
 ;; Get identity details
 (define-read-only (get-identity (user principal))
     (map-get? user-identities user)
@@ -247,6 +253,8 @@
         (get verification-status identity)
     )
 )
+
+
 
 ;; Get role permissions
 (define-read-only (get-role-permissions (role uint))
